@@ -1355,4 +1355,482 @@ def add_member(group_id):
 
                     <a
                         class="btn"
-                       
+                        href="/group/{{ group_id }}"
+                    >
+                        Back to Group
+                    </a>
+
+                </div>
+
+            </div>
+
+            """,
+            group_id=group_id
+        )
+
+    existing = conn.execute("""
+        SELECT *
+        FROM members
+        WHERE group_id=? AND user_id=?
+    """, (
+        group_id,
+        user["id"]
+    )).fetchone()
+
+    if existing:
+
+        conn.close()
+
+        return render_template_string(
+            STYLE + """
+
+            <div class="container">
+
+                <div class="card">
+
+                    <h2>⚠️ Already a Member</h2>
+
+                    <div class="error">
+                        {{ name }} is already
+                        a member of this group.
+                    </div>
+
+                    <a
+                        class="btn"
+                        href="/group/{{ group_id }}"
+                    >
+                        Back to Group
+                    </a>
+
+                </div>
+
+            </div>
+
+            """,
+            name=user["name"],
+            group_id=group_id
+        )
+
+    last_position = conn.execute("""
+        SELECT MAX(position) AS position
+        FROM members
+        WHERE group_id=?
+    """, (group_id,)).fetchone()
+
+    next_position = (
+        last_position["position"] or 0
+    ) + 1
+
+    conn.execute("""
+        INSERT INTO members
+        (
+            group_id,
+            user_id,
+            position,
+            joined_at
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        group_id,
+        user["id"],
+        next_position,
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return redirect(
+        url_for(
+            "group",
+            group_id=group_id
+        )
+    )
+
+
+# ============================================================
+# RECORD CONTRIBUTION
+# ============================================================
+
+@app.route(
+    "/group/<int:group_id>/contribution",
+    methods=["POST"]
+)
+@login_required
+def contribution(group_id):
+
+    member_id = request.form.get(
+        "member_id"
+    )
+
+    amount_text = request.form.get(
+        "amount"
+    )
+
+    conn = get_db()
+
+    # Only group owner can record payments
+    group_data = conn.execute("""
+        SELECT *
+        FROM groups
+        WHERE id=? AND creator_id=?
+    """, (
+        group_id,
+        session["user_id"]
+    )).fetchone()
+
+    if not group_data:
+
+        conn.close()
+
+        return (
+            "Only the group administrator "
+            "can record contributions.",
+            403
+        )
+
+    try:
+
+        amount = float(amount_text)
+
+        if amount <= 0:
+            raise ValueError
+
+    except (ValueError, TypeError):
+
+        conn.close()
+
+        return "Invalid contribution amount.", 400
+
+    # Make sure the member belongs to this group
+    member = conn.execute("""
+        SELECT id
+        FROM members
+        WHERE id=? AND group_id=?
+    """, (
+        member_id,
+        group_id
+    )).fetchone()
+
+    if not member:
+
+        conn.close()
+
+        return "Invalid group member.", 400
+
+    conn.execute("""
+        INSERT INTO contributions
+        (
+            group_id,
+            member_id,
+            amount,
+            date,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        group_id,
+        member_id,
+        amount,
+        datetime.now().strftime("%Y-%m-%d"),
+        "Paid"
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return redirect(
+        url_for(
+            "group",
+            group_id=group_id
+        )
+    )
+
+
+# ============================================================
+# ROTATION SCHEDULE
+# ============================================================
+
+@app.route(
+    "/group/<int:group_id>/rotation"
+)
+@login_required
+def rotation(group_id):
+
+    user_id = session["user_id"]
+
+    conn = get_db()
+
+    group_data = conn.execute("""
+        SELECT *
+        FROM groups
+        WHERE id=?
+    """, (group_id,)).fetchone()
+
+    if not group_data:
+
+        conn.close()
+
+        return "Group not found.", 404
+
+    allowed = user_is_group_member(
+        conn,
+        group_id,
+        user_id
+    )
+
+    if not allowed and group_data["creator_id"] != user_id:
+
+        conn.close()
+
+        return (
+            "You are not a member of this group.",
+            403
+        )
+
+    members = conn.execute("""
+        SELECT
+            members.id AS member_id,
+            members.position,
+            users.name,
+            users.phone
+        FROM members
+        JOIN users
+            ON users.id = members.user_id
+        WHERE members.group_id=?
+        ORDER BY members.position
+    """, (group_id,)).fetchall()
+
+    conn.close()
+
+    schedule = get_rotation_schedule(
+        group_data,
+        members
+    )
+
+    total_members = len(members)
+
+    payout_amount = (
+        group_data["contribution"]
+        * total_members
+    )
+
+    return render_template_string(
+        STYLE + """
+
+        <nav>
+
+            <a href="/dashboard">
+                Dashboard
+            </a>
+
+            <a href="/group/{{ group['id'] }}">
+                Group
+            </a>
+
+            <a href="/logout">
+                Logout
+            </a>
+
+        </nav>
+
+        <div class="container">
+
+            <div class="card">
+
+                <h1>
+                    🔄 Ajo Rotation Schedule
+                </h1>
+
+                <h2>
+                    {{ group["name"] }}
+                </h2>
+
+                <p>
+                    Contribution:
+                    <strong>
+                    ₦{{ "{:,.2f}".format(
+                        group["contribution"]
+                    ) }}
+                    </strong>
+                </p>
+
+                <p>
+                    Members:
+                    <strong>
+                        {{ total_members }}
+                    </strong>
+                </p>
+
+                <p>
+                    Expected payout each round:
+                    <strong>
+                    ₦{{ "{:,.2f}".format(
+                        payout_amount
+                    ) }}
+                    </strong>
+                </p>
+
+                <div class="info">
+
+                    Each member receives the
+                    collected contribution according
+                    to their rotation position.
+
+                </div>
+
+            </div>
+
+
+            <div class="card">
+
+                <h2>
+                    📅 Rotation Order
+                </h2>
+
+                {% if schedule %}
+
+                <table>
+
+                    <tr>
+
+                        <th>
+                            Round
+                        </th>
+
+                        <th>
+                            Recipient
+                        </th>
+
+                        <th>
+                            Position
+                        </th>
+
+                        <th>
+                            Date
+                        </th>
+
+                        <th>
+                            Expected Payout
+                        </th>
+
+                    </tr>
+
+                    {% for item in schedule %}
+
+                    <tr>
+
+                        <td>
+                            {{ item["round"] }}
+                        </td>
+
+                        <td>
+                            <strong>
+                                {{ item["member_name"] }}
+                            </strong>
+
+                            <br>
+
+                            <span class="small">
+                                {{ item["phone"] }}
+                            </span>
+                        </td>
+
+                        <td>
+                            {{ item["position"] }}
+                        </td>
+
+                        <td>
+                            {{ item["date"] }}
+                        </td>
+
+                        <td>
+                            ₦{{ "{:,.2f}".format(
+                                item["amount"]
+                            ) }}
+                        </td>
+
+                    </tr>
+
+                    {% endfor %}
+
+                </table>
+
+                {% else %}
+
+                <p>
+                    No members have been added yet.
+                </p>
+
+                {% endif %}
+
+            </div>
+
+
+            <div class="card">
+
+                <h2>
+                    ℹ️ How the Rotation Works
+                </h2>
+
+                <p>
+                    <strong>Round 1:</strong>
+                    Position 1 receives.
+                </p>
+
+                <p>
+                    <strong>Round 2:</strong>
+                    Position 2 receives.
+                </p>
+
+                <p>
+                    <strong>Round 3:</strong>
+                    Position 3 receives.
+                </p>
+
+                <p>
+                    The process continues until
+                    every member has received one
+                    payout.
+                </p>
+
+            </div>
+
+        </div>
+
+        """,
+        group=group_data,
+        schedule=schedule,
+        total_members=total_members,
+        payout_amount=payout_amount
+    )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health")
+def health():
+
+    return "AjoConnect is running!"
+
+
+# ============================================================
+# START APPLICATION
+# ============================================================
+
+init_db()
+
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=int(
+            os.environ.get(
+                "PORT",
+                5000
+            )
+        )
+    )
