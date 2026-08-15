@@ -1,18 +1,18 @@
-from flask import Flask, request, redirect, url_for, session, render_template_string
+from flask import Flask, request, redirect, url_for, session, render_template_string, flash
 import sqlite3
 import os
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
 app.secret_key = os.environ.get(
     "SECRET_KEY",
-    "change-this-secret-key-in-render"
+    "ajoconnect-development-secret-change-this"
 )
 
-DATABASE = "ajoconnect.db"
+DATABASE = os.environ.get("DATABASE_PATH", "ajoconnect.db")
 
 
 # ============================================================
@@ -22,330 +22,376 @@ DATABASE = "ajoconnect.db"
 def get_db():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db():
     conn = get_db()
 
-    # USERS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'admin',
+        created_at TEXT NOT NULL
+    );
 
-    # GROUPS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS groups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            contribution REAL NOT NULL,
-            frequency TEXT NOT NULL,
-            creator_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        contribution REAL NOT NULL DEFAULT 0,
+        frequency TEXT NOT NULL DEFAULT 'monthly',
+        created_at TEXT NOT NULL
+    );
 
-    # MEMBERS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            position INTEGER NOT NULL,
-            joined_at TEXT NOT NULL
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        phone TEXT,
+        email TEXT,
+        position INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+    );
 
-    # CONTRIBUTIONS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS contributions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            member_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            date TEXT NOT NULL,
-            status TEXT NOT NULL
-        )
+    CREATE TABLE IF NOT EXISTS contributions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        payment_date TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'paid',
+        note TEXT,
+        FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+        FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS payouts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        payout_date TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        note TEXT,
+        FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+        FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
+    );
     """)
 
     conn.commit()
     conn.close()
 
 
+init_db()
+
+
 # ============================================================
-# LOGIN PROTECTION
+# HELPERS
 # ============================================================
 
-def login_required(function):
-    @wraps(function)
-    def wrapper(*args, **kwargs):
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
         if "user_id" not in session:
             return redirect(url_for("login"))
-        return function(*args, **kwargs)
+        return view(*args, **kwargs)
 
-    return wrapper
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def user_is_group_member(conn, group_id, user_id):
-    member = conn.execute("""
-        SELECT id
-        FROM members
-        WHERE group_id=? AND user_id=?
-    """, (group_id, user_id)).fetchone()
-
-    return member is not None
+    return wrapped
 
 
-def user_is_group_owner(conn, group_id, user_id):
-    group = conn.execute("""
-        SELECT id
-        FROM groups
-        WHERE id=? AND creator_id=?
-    """, (group_id, user_id)).fetchone()
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
 
-    return group is not None
+        if session.get("role") != "admin":
+            return redirect(url_for("dashboard"))
+
+        return view(*args, **kwargs)
+
+    return wrapped
 
 
-def get_rotation_schedule(group, members):
-    """
-    Creates an automatic rotation schedule.
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    Position 1 receives first.
-    Position 2 receives second.
-    Position 3 receives third, etc.
 
-    The amount collected each round is:
+def money(value):
+    return f"₦{float(value or 0):,.2f}"
 
-        contribution amount × number of members
-    """
 
-    schedule = []
-
-    if not members:
-        return schedule
-
-    try:
-        start_date = datetime.fromisoformat(
-            group["created_at"]
-        )
-    except Exception:
-        start_date = datetime.now()
-
-    total_members = len(members)
-
-    payout_amount = group["contribution"] * total_members
-
-    for index, member in enumerate(members):
-
-        if group["frequency"].lower() == "monthly":
-            due_date = start_date + timedelta(days=30 * index)
-        else:
-            due_date = start_date + timedelta(days=7 * index)
-
-        schedule.append({
-            "round": index + 1,
-            "member_name": member["name"],
-            "phone": member["phone"],
-            "position": member["position"],
-            "date": due_date.strftime("%Y-%m-%d"),
-            "amount": payout_amount
-        })
-
-    return schedule
+app.jinja_env.filters["money"] = money
 
 
 # ============================================================
-# HTML STYLE
+# DESIGN
 # ============================================================
 
-STYLE = """
-<style>
+BASE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-* {
-    box-sizing: border-box;
-}
+    <title>{{ title or "AjoConnect" }}</title>
 
-body {
-    font-family: Arial, sans-serif;
-    background: #f4f7f6;
-    margin: 0;
-    color: #222;
-}
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-nav {
-    background: #087f5b;
-    padding: 15px;
-    color: white;
-}
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f7f6;
+            color: #1f2937;
+        }
 
-nav a {
-    color: white;
-    text-decoration: none;
-    margin-right: 18px;
-    font-weight: bold;
-}
+        nav {
+            background: #075e54;
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
 
-.container {
-    max-width: 950px;
-    margin: 30px auto;
-    padding: 20px;
-}
+        nav a {
+            color: white;
+            text-decoration: none;
+            margin-left: 12px;
+            font-weight: bold;
+        }
 
-.card {
-    background: white;
-    padding: 25px;
-    margin-bottom: 20px;
-    border-radius: 12px;
-    box-shadow: 0 2px 8px rgba(0,0,0,.08);
-}
+        .brand {
+            font-size: 22px;
+            font-weight: bold;
+        }
 
-.hero {
-    text-align: center;
-    padding: 60px 20px;
-}
+        .container {
+            max-width: 1100px;
+            margin: 25px auto;
+            padding: 0 15px;
+        }
 
-.hero h1 {
-    color: #087f5b;
-    font-size: 45px;
-}
+        .hero {
+            background: linear-gradient(135deg, #075e54, #128c7e);
+            color: white;
+            padding: 30px;
+            border-radius: 16px;
+            margin-bottom: 25px;
+        }
 
-input,
-select {
-    width: 100%;
-    padding: 12px;
-    margin: 8px 0 15px;
-    border: 1px solid #ccc;
-    border-radius: 7px;
-}
+        .hero h1 {
+            margin-top: 0;
+        }
 
-button,
-.btn {
-    background: #087f5b;
-    color: white;
-    border: none;
-    padding: 12px 18px;
-    border-radius: 7px;
-    cursor: pointer;
-    text-decoration: none;
-    display: inline-block;
-}
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
 
-button:hover,
-.btn:hover {
-    background: #056044;
-}
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            margin-bottom: 20px;
+        }
 
-.btn-secondary {
-    background: #495057;
-}
+        .stat {
+            font-size: 27px;
+            font-weight: bold;
+            color: #075e54;
+            margin-top: 8px;
+        }
 
-.btn-danger {
-    background: #c92a2a;
-}
+        .btn {
+            display: inline-block;
+            border: none;
+            background: #075e54;
+            color: white;
+            padding: 11px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+            font-weight: bold;
+        }
 
-.stat {
-    display: inline-block;
-    width: 30%;
-    margin: 1%;
-    background: #e9f7f2;
-    padding: 20px;
-    border-radius: 10px;
-    text-align: center;
-}
+        .btn:hover {
+            opacity: .9;
+        }
 
-.error {
-    background: #ffe3e3;
-    padding: 12px;
-    border-radius: 7px;
-    color: #a00;
-    margin-bottom: 15px;
-}
+        .btn-danger {
+            background: #c62828;
+        }
 
-.success {
-    background: #d3f9d8;
-    padding: 12px;
-    border-radius: 7px;
-    color: #176b24;
-    margin-bottom: 15px;
-}
+        .btn-warning {
+            background: #e09f00;
+        }
 
-.info {
-    background: #e7f5ff;
-    padding: 12px;
-    border-radius: 7px;
-    color: #1864ab;
-    margin-bottom: 15px;
-}
+        .btn-secondary {
+            background: #555;
+        }
 
-.badge {
-    display: inline-block;
-    background: #087f5b;
-    color: white;
-    padding: 5px 9px;
-    border-radius: 20px;
-    font-size: 12px;
-}
+        input, select, textarea {
+            width: 100%;
+            padding: 12px;
+            margin-top: 6px;
+            margin-bottom: 15px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 15px;
+        }
 
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
+        label {
+            font-weight: bold;
+        }
 
-th,
-td {
-    padding: 10px;
-    border-bottom: 1px solid #ddd;
-    text-align: left;
-}
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
 
-.small {
-    color: #666;
-    font-size: 14px;
-}
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            text-align: left;
+        }
 
-@media(max-width:600px) {
+        th {
+            background: #f0f4f3;
+        }
 
-    .container {
-        margin: 10px auto;
-        padding: 12px;
-    }
+        .table-wrap {
+            overflow-x: auto;
+        }
 
-    .stat {
-        width: 90%;
-        margin: 5px;
-    }
+        .badge {
+            display: inline-block;
+            padding: 5px 9px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+        }
 
-    table {
-        font-size: 13px;
-    }
+        .paid {
+            background: #d7f5df;
+            color: #176b35;
+        }
 
-    th,
-    td {
-        padding: 7px;
-    }
+        .pending {
+            background: #fff0c2;
+            color: #7a5700;
+        }
 
-    .hero h1 {
-        font-size: 35px;
-    }
+        .danger {
+            background: #ffdede;
+            color: #9b111e;
+        }
 
-    nav a {
-        display: inline-block;
-        margin-bottom: 8px;
-    }
-}
+        .success {
+            background: #d7f5df;
+            color: #176b35;
+        }
 
-</style>
+        .flash {
+            padding: 12px 15px;
+            background: #fff3cd;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #777;
+        }
+
+        @media(max-width: 600px) {
+            nav {
+                display: block;
+            }
+
+            nav a {
+                display: inline-block;
+                margin: 8px 8px 0 0;
+            }
+
+            th, td {
+                font-size: 13px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<nav>
+    <div class="brand">💰 AjoConnect</div>
+
+    <div>
+        {% if session.get("user_id") %}
+            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('groups') }}">Groups</a>
+
+            {% if session.get("role") == "admin" %}
+                <a href="{{ url_for('admin_dashboard') }}">Admin</a>
+            {% endif %}
+
+            <a href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+            <a href="{{ url_for('login') }}">Login</a>
+            <a href="{{ url_for('register') }}">Register</a>
+        {% endif %}
+    </div>
+</nav>
+
+<div class="container">
+
+    {% with messages = get_flashed_messages() %}
+        {% for message in messages %}
+            <div class="flash">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+
+    {{ content|safe }}
+
+</div>
+
+<footer>
+    AjoConnect © 2026 — Digital Ajo & Esusu Management
+</footer>
+
+</body>
+</html>
 """
+
+
+def page(title, content):
+    return render_template_string(
+        BASE_HTML,
+        title=title,
+        content=content
+    )
 
 
 # ============================================================
@@ -358,33 +404,44 @@ def home():
     if "user_id" in session:
         return redirect(url_for("dashboard"))
 
-    return render_template_string(STYLE + """
-
+    content = """
     <div class="hero">
-
-        <h1>💰 AjoConnect</h1>
-
-        <h2>Digital Ajo & Esusu Savings</h2>
-
+        <h1>💰 Welcome to AjoConnect</h1>
         <p>
-            Create savings groups, manage members,
-            track contributions and organize your
-            automatic rotation schedule.
+            Manage your Ajo / Esusu savings group,
+            contributions and rotation schedule in one place.
         </p>
 
-        <br>
-
-        <a class="btn" href="/register">
-            Create Account
-        </a>
-
-        <a class="btn" href="/login">
-            Login
-        </a>
-
+        <a class="btn" href="/register">Create Account</a>
+        <a class="btn btn-secondary" href="/login">Login</a>
     </div>
 
-    """)
+    <div class="grid">
+
+        <div class="card">
+            <h3>👥 Manage Members</h3>
+            <p>Add members and organize their rotation positions.</p>
+        </div>
+
+        <div class="card">
+            <h3>💵 Track Contributions</h3>
+            <p>Record payments and see who has paid.</p>
+        </div>
+
+        <div class="card">
+            <h3>🔄 Rotation</h3>
+            <p>Know who receives the Ajo payout next.</p>
+        </div>
+
+        <div class="card">
+            <h3>📊 Dashboard</h3>
+            <p>See your group's financial activity.</p>
+        </div>
+
+    </div>
+    """
+
+    return page("Home", content)
 
 
 # ============================================================
@@ -394,117 +451,72 @@ def home():
 @app.route("/register", methods=["GET", "POST"])
 def register():
 
-    error = ""
-
     if request.method == "POST":
 
         name = request.form.get("name", "").strip()
-        phone = request.form.get("phone", "").strip()
+        email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
 
-        if not name or not phone or not password:
+        if not name or not email or not password:
+            flash("Please complete all fields.")
+            return redirect(url_for("register"))
 
-            error = "Please complete all fields."
+        conn = get_db()
 
-        elif len(password) < 6:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,)
+        ).fetchone()
 
-            error = "Password must be at least 6 characters."
+        if existing:
+            conn.close()
+            flash("An account with this email already exists.")
+            return redirect(url_for("login"))
 
-        else:
+        conn.execute(
+            """
+            INSERT INTO users
+            (name, email, password, role, created_at)
+            VALUES (?, ?, ?, 'admin', ?)
+            """,
+            (
+                name,
+                email,
+                generate_password_hash(password),
+                now()
+            )
+        )
 
-            conn = get_db()
+        conn.commit()
+        conn.close()
 
-            try:
+        flash("Account created successfully. Please login.")
+        return redirect(url_for("login"))
 
-                hashed_password = generate_password_hash(password)
+    content = """
+    <div class="card">
+        <h2>📝 Create AjoConnect Account</h2>
 
-                conn.execute("""
-                    INSERT INTO users
-                    (name, phone, password, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    name,
-                    phone,
-                    hashed_password,
-                    datetime.now().isoformat()
-                ))
+        <form method="POST">
 
-                conn.commit()
+            <label>Full Name</label>
+            <input type="text" name="name" required>
 
-                user = conn.execute("""
-                    SELECT id
-                    FROM users
-                    WHERE phone=?
-                """, (phone,)).fetchone()
+            <label>Email</label>
+            <input type="email" name="email" required>
 
-                conn.close()
+            <label>Password</label>
+            <input type="password" name="password" required>
 
-                session["user_id"] = user["id"]
-                session["user_name"] = name
+            <button class="btn" type="submit">
+                Create Account
+            </button>
 
-                return redirect(url_for("dashboard"))
-
-            except sqlite3.IntegrityError:
-
-                conn.close()
-
-                error = "This phone number is already registered."
-
-    return render_template_string(STYLE + """
-
-    <div class="container">
-
-        <div class="card">
-
-            <h2>👤 Create AjoConnect Account</h2>
-
-            {% if error %}
-                <div class="error">{{ error }}</div>
-            {% endif %}
-
-            <form method="POST">
-
-                <label>Full Name</label>
-
-                <input
-                    name="name"
-                    placeholder="Your full name"
-                    required
-                >
-
-                <label>Phone Number</label>
-
-                <input
-                    name="phone"
-                    placeholder="08012345678"
-                    required
-                >
-
-                <label>Password</label>
-
-                <input
-                    type="password"
-                    name="password"
-                    minlength="6"
-                    required
-                >
-
-                <button type="submit">
-                    Create Account
-                </button>
-
-            </form>
-
-            <p>
-                Already have an account?
-                <a href="/login">Login</a>
-            </p>
-
-        </div>
-
+        </form>
     </div>
+    """
 
-    """, error=error)
+    return page("Register", content)
 
 
 # ============================================================
@@ -514,108 +526,53 @@ def register():
 @app.route("/login", methods=["GET", "POST"])
 def login():
 
-    error = ""
-
     if request.method == "POST":
 
-        phone = request.form.get("phone", "").strip()
+        email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
 
         conn = get_db()
 
-        user = conn.execute("""
-            SELECT *
-            FROM users
-            WHERE phone=?
-        """, (phone,)).fetchone()
+        user = conn.execute(
+            "SELECT * FROM users WHERE email = ?",
+            (email,)
+        ).fetchone()
 
         conn.close()
 
-        if user:
+        if user and check_password_hash(user["password"], password):
 
-            password_valid = False
+            session.clear()
 
-            try:
-                password_valid = check_password_hash(
-                    user["password"],
-                    password
-                )
-            except Exception:
-                password_valid = False
+            session["user_id"] = user["id"]
+            session["name"] = user["name"]
+            session["role"] = user["role"]
 
-            # Temporary compatibility with accounts
-            # created by the old version.
-            if not password_valid and user["password"] == password:
+            return redirect(url_for("dashboard"))
 
-                password_valid = True
+        flash("Invalid email or password.")
 
-                conn = get_db()
+    content = """
+    <div class="card">
+        <h2>🔐 Login</h2>
 
-                new_hash = generate_password_hash(password)
+        <form method="POST">
 
-                conn.execute("""
-                    UPDATE users
-                    SET password=?
-                    WHERE id=?
-                """, (new_hash, user["id"]))
+            <label>Email</label>
+            <input type="email" name="email" required>
 
-                conn.commit()
-                conn.close()
+            <label>Password</label>
+            <input type="password" name="password" required>
 
-            if password_valid:
+            <button class="btn" type="submit">
+                Login
+            </button>
 
-                session["user_id"] = user["id"]
-                session["user_name"] = user["name"]
-
-                return redirect(url_for("dashboard"))
-
-        error = "Invalid phone number or password."
-
-    return render_template_string(STYLE + """
-
-    <div class="container">
-
-        <div class="card">
-
-            <h2>🔐 Login</h2>
-
-            {% if error %}
-                <div class="error">{{ error }}</div>
-            {% endif %}
-
-            <form method="POST">
-
-                <label>Phone Number</label>
-
-                <input
-                    name="phone"
-                    required
-                >
-
-                <label>Password</label>
-
-                <input
-                    type="password"
-                    name="password"
-                    required
-                >
-
-                <button type="submit">
-                    Login
-                </button>
-
-            </form>
-
-            <p>
-                Don't have an account?
-                <a href="/register">Register</a>
-            </p>
-
-        </div>
-
+        </form>
     </div>
+    """
 
-    """, error=error)
+    return page("Login", content)
 
 
 # ============================================================
@@ -627,825 +584,673 @@ def logout():
 
     session.clear()
 
-    return redirect(url_for("home"))
+    flash("You have been logged out.")
+
+    return redirect(url_for("login"))
 
 
 # ============================================================
-# MAIN DASHBOARD
+# DASHBOARD
 # ============================================================
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
 
-    user_id = session["user_id"]
-
     conn = get_db()
 
-    # Groups created by the user
-    created_groups = conn.execute("""
-        SELECT *
-        FROM groups
-        WHERE creator_id=?
-        ORDER BY id DESC
-    """, (user_id,)).fetchall()
+    groups = conn.execute(
+        "SELECT * FROM groups ORDER BY id DESC"
+    ).fetchall()
 
-    # Groups where user is a member
-    joined_groups = conn.execute("""
-        SELECT
-            groups.*
-        FROM groups
-        JOIN members
-            ON members.group_id = groups.id
-        WHERE members.user_id=?
-        ORDER BY groups.id DESC
-    """, (user_id,)).fetchall()
+    total_members = conn.execute(
+        "SELECT COUNT(*) AS total FROM members"
+    ).fetchone()["total"]
 
-    member_count = conn.execute("""
-        SELECT COUNT(*) AS count
-        FROM members
-        WHERE user_id=?
-    """, (user_id,)).fetchone()["count"]
+    total_contributions = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM contributions
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
+
+    total_payouts = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM payouts
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
 
     conn.close()
 
-    # Remove duplicate groups
-    all_groups = {}
+    content = f"""
+    <div class="hero">
+        <h1>👋 Welcome, {session.get("name")}</h1>
+        <p>Manage your Ajo groups and savings activities.</p>
+    </div>
 
-    for group in created_groups:
-        all_groups[group["id"]] = group
-
-    for group in joined_groups:
-        all_groups[group["id"]] = group
-
-    groups = list(all_groups.values())
-
-    return render_template_string(STYLE + """
-
-    <nav>
-
-        <a href="/dashboard">🏠 AjoConnect</a>
-
-        <a href="/create-group">
-            ➕ Create Group
-        </a>
-
-        <a href="/logout">
-            Logout
-        </a>
-
-    </nav>
-
-    <div class="container">
-
-        <h1>
-            Welcome, {{ name }} 👋
-        </h1>
-
-        <div class="stat">
-            <h2>{{ groups|length }}</h2>
-            <p>Your Groups</p>
-        </div>
-
-        <div class="stat">
-            <h2>{{ member_count }}</h2>
-            <p>Your Memberships</p>
-        </div>
-
-        <br><br>
+    <div class="grid">
 
         <div class="card">
+            <h3>👥 Members</h3>
+            <div class="stat">{total_members}</div>
+        </div>
 
-            <h2>👥 Your Ajo Groups</h2>
+        <div class="card">
+            <h3>💰 Contributions</h3>
+            <div class="stat">{money(total_contributions)}</div>
+        </div>
 
-            {% if groups %}
-
-                {% for group in groups %}
-
-                    <div class="card">
-
-                        <h3>
-                            {{ group["name"] }}
-                        </h3>
-
-                        <p>
-                            Contribution:
-                            <strong>
-                            ₦{{ "{:,.2f}".format(
-                                group["contribution"]
-                            ) }}
-                            </strong>
-                        </p>
-
-                        <p>
-                            Frequency:
-                            {{ group["frequency"] }}
-                        </p>
-
-                        <a
-                            class="btn"
-                            href="/group/{{ group['id'] }}"
-                        >
-                            Open Group
-                        </a>
-
-                        <a
-                            class="btn btn-secondary"
-                            href="/group/{{ group['id'] }}/rotation"
-                        >
-                            🔄 Rotation
-                        </a>
-
-                    </div>
-
-                {% endfor %}
-
-            {% else %}
-
-                <p>
-                    You haven't joined an Ajo group yet.
-                </p>
-
-                <a
-                    class="btn"
-                    href="/create-group"
-                >
-                    Create Your First Group
-                </a>
-
-            {% endif %}
-
+        <div class="card">
+            <h3>💸 Payouts</h3>
+            <div class="stat">{money(total_payouts)}</div>
         </div>
 
     </div>
 
-    """,
-    name=session["user_name"],
-    groups=groups,
-    member_count=member_count)
+    <div class="card">
+        <div class="actions">
+            <a class="btn" href="/groups/new">
+                ➕ Create Ajo Group
+            </a>
+
+            <a class="btn btn-secondary" href="/groups">
+                📋 View Groups
+            </a>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Your Ajo Groups</h2>
+
+        <div class="table-wrap">
+        <table>
+            <tr>
+                <th>Group</th>
+                <th>Contribution</th>
+                <th>Frequency</th>
+                <th>Action</th>
+            </tr>
+    """
+
+    for group in groups:
+        content += f"""
+            <tr>
+                <td>{group["name"]}</td>
+                <td>{money(group["contribution"])}</td>
+                <td>{group["frequency"].title()}</td>
+                <td>
+                    <a class="btn"
+                       href="/group/{group["id"]}">
+                       Open
+                    </a>
+                </td>
+            </tr>
+        """
+
+    content += """
+        </table>
+        </div>
+    </div>
+    """
+
+    return page("Dashboard", content)
+
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
+
+    conn = get_db()
+
+    users = conn.execute(
+        "SELECT COUNT(*) AS total FROM users"
+    ).fetchone()["total"]
+
+    groups = conn.execute(
+        "SELECT COUNT(*) AS total FROM groups"
+    ).fetchone()["total"]
+
+    members = conn.execute(
+        "SELECT COUNT(*) AS total FROM members"
+    ).fetchone()["total"]
+
+    contributions = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM contributions
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
+
+    payouts = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM payouts
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
+
+    conn.close()
+
+    content = f"""
+    <div class="hero">
+        <h1>⚙️ Admin Dashboard</h1>
+        <p>Overview of your AjoConnect platform.</p>
+    </div>
+
+    <div class="grid">
+
+        <div class="card">
+            <h3>Users</h3>
+            <div class="stat">{users}</div>
+        </div>
+
+        <div class="card">
+            <h3>Ajo Groups</h3>
+            <div class="stat">{groups}</div>
+        </div>
+
+        <div class="card">
+            <h3>Members</h3>
+            <div class="stat">{members}</div>
+        </div>
+
+        <div class="card">
+            <h3>Contributions</h3>
+            <div class="stat">{money(contributions)}</div>
+        </div>
+
+        <div class="card">
+            <h3>Payouts</h3>
+            <div class="stat">{money(payouts)}</div>
+        </div>
+
+    </div>
+    """
+
+    return page("Admin Dashboard", content)
+
+
+# ============================================================
+# GROUPS
+# ============================================================
+
+@app.route("/groups")
+@login_required
+def groups():
+
+    conn = get_db()
+
+    all_groups = conn.execute(
+        "SELECT * FROM groups ORDER BY id DESC"
+    ).fetchall()
+
+    conn.close()
+
+    content = """
+    <div class="card">
+        <div class="actions">
+            <h2 style="margin-right:auto;">📋 Ajo Groups</h2>
+
+            <a class="btn" href="/groups/new">
+                ➕ New Group
+            </a>
+        </div>
+    </div>
+
+    <div class="grid">
+    """
+
+    for group in all_groups:
+
+        content += f"""
+        <div class="card">
+
+            <h2>{group["name"]}</h2>
+
+            <p>
+                Contribution:
+                <strong>{money(group["contribution"])}</strong>
+            </p>
+
+            <p>
+                Frequency:
+                <strong>{group["frequency"].title()}</strong>
+            </p>
+
+            <a class="btn" href="/group/{group["id"]}">
+                Open Group
+            </a>
+
+        </div>
+        """
+
+    content += "</div>"
+
+    return page("Groups", content)
 
 
 # ============================================================
 # CREATE GROUP
 # ============================================================
 
-@app.route("/create-group", methods=["GET", "POST"])
+@app.route("/groups/new", methods=["GET", "POST"])
 @login_required
 def create_group():
-
-    error = ""
 
     if request.method == "POST":
 
         name = request.form.get("name", "").strip()
-        contribution_text = request.form.get(
-            "contribution",
-            ""
-        ).strip()
+        contribution = request.form.get("contribution", "0")
+        frequency = request.form.get("frequency", "monthly")
 
-        frequency = request.form.get(
-            "frequency",
-            "Weekly"
+        try:
+            contribution = float(contribution)
+        except ValueError:
+            flash("Contribution must be a valid amount.")
+            return redirect(url_for("create_group"))
+
+        if not name:
+            flash("Group name is required.")
+            return redirect(url_for("create_group"))
+
+        conn = get_db()
+
+        conn.execute(
+            """
+            INSERT INTO groups
+            (name, contribution, frequency, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                name,
+                contribution,
+                frequency,
+                now()
+            )
         )
 
-        if not name or not contribution_text:
+        conn.commit()
 
-            error = "Please complete all fields."
+        group_id = conn.execute(
+            "SELECT last_insert_rowid()"
+        ).fetchone()[0]
 
-        else:
+        conn.close()
 
-            try:
-                contribution = float(contribution_text)
+        flash("Ajo group created successfully.")
 
-                if contribution <= 0:
-                    raise ValueError
+        return redirect(url_for("group_detail", group_id=group_id))
 
-            except ValueError:
+    content = """
+    <div class="card">
 
-                error = "Enter a valid contribution amount."
+        <h2>➕ Create Ajo Group</h2>
 
-            if not error:
+        <form method="POST">
 
-                conn = get_db()
+            <label>Group Name</label>
+            <input
+                type="text"
+                name="name"
+                placeholder="e.g. Mama Raji"
+                required
+            >
 
-                cursor = conn.execute("""
-                    INSERT INTO groups
-                    (
-                        name,
-                        contribution,
-                        frequency,
-                        creator_id,
-                        created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    name,
-                    contribution,
-                    frequency,
-                    session["user_id"],
-                    datetime.now().isoformat()
-                ))
+            <label>Contribution Amount</label>
+            <input
+                type="number"
+                name="contribution"
+                min="0"
+                step="0.01"
+                placeholder="10000"
+                required
+            >
 
-                group_id = cursor.lastrowid
+            <label>Contribution Frequency</label>
 
-                # Creator automatically becomes position 1
-                conn.execute("""
-                    INSERT INTO members
-                    (
-                        group_id,
-                        user_id,
-                        position,
-                        joined_at
-                    )
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    group_id,
-                    session["user_id"],
-                    1,
-                    datetime.now().isoformat()
-                ))
+            <select name="frequency">
+                <option value="weekly">Weekly</option>
+                <option value="biweekly">Bi-weekly</option>
+                <option value="monthly" selected>Monthly</option>
+            </select>
 
-                conn.commit()
-                conn.close()
+            <button class="btn" type="submit">
+                Create Group
+            </button>
 
-                return redirect(
-                    url_for(
-                        "group",
-                        group_id=group_id
-                    )
-                )
-
-    return render_template_string(STYLE + """
-
-    <nav>
-
-        <a href="/dashboard">
-            Dashboard
-        </a>
-
-        <a href="/logout">
-            Logout
-        </a>
-
-    </nav>
-
-    <div class="container">
-
-        <div class="card">
-
-            <h2>➕ Create Ajo Group</h2>
-
-            {% if error %}
-                <div class="error">
-                    {{ error }}
-                </div>
-            {% endif %}
-
-            <form method="POST">
-
-                <label>Group Name</label>
-
-                <input
-                    name="name"
-                    placeholder="e.g. Family Ajo"
-                    required
-                >
-
-                <label>
-                    Contribution Amount (₦)
-                </label>
-
-                <input
-                    type="number"
-                    name="contribution"
-                    min="1"
-                    step="0.01"
-                    placeholder="10000"
-                    required
-                >
-
-                <label>
-                    Contribution Frequency
-                </label>
-
-                <select name="frequency">
-
-                    <option value="Weekly">
-                        Weekly
-                    </option>
-
-                    <option value="Monthly">
-                        Monthly
-                    </option>
-
-                </select>
-
-                <button type="submit">
-                    Create Ajo Group
-                </button>
-
-            </form>
-
-        </div>
+        </form>
 
     </div>
+    """
 
-    """, error=error)
+    return page("Create Group", content)
 
 
 # ============================================================
-# GROUP DASHBOARD
+# GROUP DETAIL
 # ============================================================
 
 @app.route("/group/<int:group_id>")
 @login_required
-def group(group_id):
-
-    user_id = session["user_id"]
+def group_detail(group_id):
 
     conn = get_db()
 
-    group_data = conn.execute("""
-        SELECT *
-        FROM groups
-        WHERE id=?
-    """, (group_id,)).fetchone()
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
 
-    if not group_data:
-
+    if not group:
         conn.close()
-
         return "Group not found", 404
 
-    # Only group members or owner can see group
-    allowed = user_is_group_member(
-        conn,
-        group_id,
-        user_id
-    )
-
-    if not allowed and group_data["creator_id"] != user_id:
-
-        conn.close()
-
-        return "You are not a member of this group.", 403
-
-    members = conn.execute("""
-        SELECT
-            members.id AS member_id,
-            members.position,
-            users.name,
-            users.phone
+    members = conn.execute(
+        """
+        SELECT *
         FROM members
-        JOIN users
-            ON users.id = members.user_id
-        WHERE members.group_id=?
-        ORDER BY members.position
-    """, (group_id,)).fetchall()
+        WHERE group_id = ?
+        ORDER BY position ASC
+        """,
+        (group_id,)
+    ).fetchall()
 
-    contributions = conn.execute("""
-        SELECT
-            contributions.amount,
-            contributions.date,
-            contributions.status,
-            users.name
+    paid_total = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
         FROM contributions
-        JOIN members
-            ON members.id = contributions.member_id
-        JOIN users
-            ON users.id = members.user_id
-        WHERE contributions.group_id=?
-        ORDER BY contributions.id DESC
-    """, (group_id,)).fetchall()
+        WHERE group_id = ?
+        AND status = 'paid'
+        """,
+        (group_id,)
+    ).fetchone()["total"]
 
-    is_owner = (
-        group_data["creator_id"] == user_id
-    )
+    payout_total = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM payouts
+        WHERE group_id = ?
+        AND status = 'paid'
+        """,
+        (group_id,)
+    ).fetchone()["total"]
+
+    current_member = None
+
+    for member in members:
+
+        payout = conn.execute(
+            """
+            SELECT id
+            FROM payouts
+            WHERE group_id = ?
+            AND member_id = ?
+            AND status = 'paid'
+            """,
+            (group_id, member["id"])
+        ).fetchone()
+
+        if not payout:
+            current_member = member
+            break
 
     conn.close()
 
-    return render_template_string(STYLE + """
+    expected_payout = group["contribution"] * len(members)
 
-    <nav>
+    content = f"""
+    <div class="hero">
 
-        <a href="/dashboard">
-            Dashboard
-        </a>
+        <h1>🔄 {group["name"]}</h1>
 
-        <a href="/group/{{ group['id'] }}/rotation">
-            🔄 Rotation
-        </a>
+        <p>
+            Contribution:
+            <strong>{money(group["contribution"])}</strong>
+        </p>
 
-        <a href="/logout">
-            Logout
-        </a>
+        <p>
+            Members:
+            <strong>{len(members)}</strong>
+        </p>
 
-    </nav>
+        <p>
+            Expected payout each round:
+            <strong>{money(expected_payout)}</strong>
+        </p>
 
-    <div class="container">
+    </div>
+
+    <div class="grid">
 
         <div class="card">
-
-            <h1>
-                👥 {{ group["name"] }}
-            </h1>
-
-            <p>
-                Contribution:
-                <strong>
-                    ₦{{ "{:,.2f}".format(
-                        group["contribution"]
-                    ) }}
-                </strong>
-            </p>
-
-            <p>
-                Frequency:
-                <strong>
-                    {{ group["frequency"] }}
-                </strong>
-            </p>
-
-            {% if is_owner %}
-                <span class="badge">
-                    GROUP ADMIN
-                </span>
-            {% else %}
-                <span class="badge">
-                    MEMBER
-                </span>
-            {% endif %}
-
+            <h3>Total Contributions</h3>
+            <div class="stat">{money(paid_total)}</div>
         </div>
 
-
-        {% if is_owner %}
+        <div class="card">
+            <h3>Total Payouts</h3>
+            <div class="stat">{money(payout_total)}</div>
+        </div>
 
         <div class="card">
-
-            <h2>➕ Add Member</h2>
-
-            <div class="info">
-
-                The person must already have an
-                AjoConnect account.
-
-                Enter the phone number they used
-                during registration.
-
+            <h3>Current Beneficiary</h3>
+            <div class="stat">
+                {current_member["name"] if current_member else "Completed"}
             </div>
-
-            <form method="POST"
-                  action="/group/{{ group['id'] }}/add-member">
-
-                <label>
-                    Member Phone Number
-                </label>
-
-                <input
-                    type="tel"
-                    name="phone"
-                    placeholder="08012345678"
-                    required
-                >
-
-                <button type="submit">
-                    Add Member
-                </button>
-
-            </form>
-
         </div>
 
-        {% endif %}
+    </div>
 
+    <div class="card">
 
-        <div class="card">
+        <div class="actions">
 
-            <h2>👤 Members</h2>
-
-            <table>
-
-                <tr>
-                    <th>Position</th>
-                    <th>Name</th>
-                    <th>Phone</th>
-                </tr>
-
-                {% for member in members %}
-
-                <tr>
-
-                    <td>
-                        {{ member["position"] }}
-                    </td>
-
-                    <td>
-                        {{ member["name"] }}
-                    </td>
-
-                    <td>
-                        {{ member["phone"] }}
-                    </td>
-
-                </tr>
-
-                {% endfor %}
-
-            </table>
-
-        </div>
-
-
-        <div class="card">
-
-            <h2>🔄 Rotation</h2>
-
-            <p>
-                The rotation order is based on member position.
-            </p>
-
-            <a
-                class="btn"
-                href="/group/{{ group['id'] }}/rotation"
-            >
-                View Rotation Schedule
+            <a class="btn"
+               href="/group/{group_id}/member/add">
+               ➕ Add Member
             </a>
 
-        </div>
+            <a class="btn btn-secondary"
+               href="/group/{group_id}/contributions">
+               💰 Contributions
+            </a>
 
-
-        {% if is_owner %}
-
-        <div class="card">
-
-            <h2>💰 Record Contribution</h2>
-
-            <form method="POST"
-                  action="/group/{{ group['id'] }}/contribution">
-
-                <label>Member</label>
-
-                <select name="member_id">
-
-                    {% for member in members %}
-
-                    <option
-                        value="{{ member['member_id'] }}"
-                    >
-                        {{ member["name"] }}
-                    </option>
-
-                    {% endfor %}
-
-                </select>
-
-                <label>Amount</label>
-
-                <input
-                    type="number"
-                    name="amount"
-                    value="{{ group['contribution'] }}"
-                    min="0"
-                    step="0.01"
-                    required
-                >
-
-                <button type="submit">
-                    Record Payment
-                </button>
-
-            </form>
-
-        </div>
-
-        {% endif %}
-
-
-        <div class="card">
-
-            <h2>💰 Contributions</h2>
-
-            {% if contributions %}
-
-            <table>
-
-                <tr>
-                    <th>Member</th>
-                    <th>Amount</th>
-                    <th>Date</th>
-                    <th>Status</th>
-                </tr>
-
-                {% for payment in contributions %}
-
-                <tr>
-
-                    <td>
-                        {{ payment["name"] }}
-                    </td>
-
-                    <td>
-                        ₦{{ "{:,.2f}".format(
-                            payment["amount"]
-                        ) }}
-                    </td>
-
-                    <td>
-                        {{ payment["date"] }}
-                    </td>
-
-                    <td>
-                        {{ payment["status"] }}
-                    </td>
-
-                </tr>
-
-                {% endfor %}
-
-            </table>
-
-            {% else %}
-
-            <p>
-                No contributions recorded yet.
-            </p>
-
-            {% endif %}
+            <a class="btn btn-secondary"
+               href="/group/{group_id}/payouts">
+               💸 Payouts
+            </a>
 
         </div>
 
     </div>
 
-    """,
-    group=group_data,
-    members=members,
-    contributions=contributions,
-    is_owner=is_owner)
+    <div class="card">
+
+        <h2>📅 Rotation Schedule</h2>
+
+        <div class="table-wrap">
+
+        <table>
+
+            <tr>
+                <th>Position</th>
+                <th>Member</th>
+                <th>Phone</th>
+                <th>Status</th>
+                <th>Expected Payout</th>
+                <th>Action</th>
+            </tr>
+    """
+
+    for member in members:
+
+        content += f"""
+        <tr>
+
+            <td>{member["position"]}</td>
+
+            <td>
+                <strong>{member["name"]}</strong>
+            </td>
+
+            <td>{member["phone"] or "-"}</td>
+
+            <td>
+                <span class="badge success">
+                    {member["status"].title()}
+                </span>
+            </td>
+
+            <td>{money(expected_payout)}</td>
+
+            <td>
+
+                <div class="actions">
+
+                    <a class="btn"
+                       href="/group/{group_id}/member/{member["id"]}/contribute">
+                       Payment
+                    </a>
+
+                    <a class="btn btn-warning"
+                       href="/group/{group_id}/member/{member["id"]}/payout">
+                       Payout
+                    </a>
+
+                </div>
+
+            </td>
+
+        </tr>
+        """
+
+    content += """
+        </table>
+        </div>
+    </div>
+    """
+
+    return page(group["name"], content)
 
 
 # ============================================================
 # ADD MEMBER
 # ============================================================
 
-@app.route(
-    "/group/<int:group_id>/add-member",
-    methods=["POST"]
-)
+@app.route("/group/<int:group_id>/member/add", methods=["GET", "POST"])
 @login_required
 def add_member(group_id):
 
-    phone = request.form.get(
-        "phone",
-        ""
-    ).strip()
-
     conn = get_db()
 
-    # Only group owner can add members
-    group_data = conn.execute("""
-        SELECT *
-        FROM groups
-        WHERE id=? AND creator_id=?
-    """, (
-        group_id,
-        session["user_id"]
-    )).fetchone()
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
 
-    if not group_data:
-
+    if not group:
         conn.close()
+        return "Group not found", 404
 
-        return (
-            "Only the group administrator can "
-            "add members.",
-            403
-        )
+    if request.method == "POST":
 
-    user = conn.execute("""
-        SELECT *
-        FROM users
-        WHERE phone=?
-    """, (phone,)).fetchone()
+        name = request.form.get("name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        email = request.form.get("email", "").strip()
 
-    if not user:
+        if not name:
+            conn.close()
+            flash("Member name is required.")
+            return redirect(url_for("add_member", group_id=group_id))
 
-        conn.close()
-
-        return render_template_string(
-            STYLE + """
-
-            <div class="container">
-
-                <div class="card">
-
-                    <h2>❌ Member Not Found</h2>
-
-                    <div class="error">
-
-                        No AjoConnect account was
-                        found with this phone number.
-
-                    </div>
-
-                    <p>
-                        Ask the person to register
-                        on AjoConnect first.
-                    </p>
-
-                    <a
-                        class="btn"
-                        href="/group/{{ group_id }}"
-                    >
-                        Back to Group
-                    </a>
-
-                </div>
-
-            </div>
-
+        next_position = conn.execute(
+            """
+            SELECT COALESCE(MAX(position),0) + 1 AS next_position
+            FROM members
+            WHERE group_id = ?
             """,
-            group_id=group_id
+            (group_id,)
+        ).fetchone()["next_position"]
+
+        conn.execute(
+            """
+            INSERT INTO members
+            (group_id, name, phone, email, position, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                group_id,
+                name,
+                phone,
+                email,
+                next_position,
+                now()
+            )
         )
 
-    existing = conn.execute("""
-        SELECT *
-        FROM members
-        WHERE group_id=? AND user_id=?
-    """, (
-        group_id,
-        user["id"]
-    )).fetchone()
-
-    if existing:
-
+        conn.commit()
         conn.close()
 
-        return render_template_string(
-            STYLE + """
+        flash(f"{name} has been added to the Ajo group.")
 
-            <div class="container">
-
-                <div class="card">
-
-                    <h2>⚠️ Already a Member</h2>
-
-                    <div class="error">
-                        {{ name }} is already
-                        a member of this group.
-                    </div>
-
-                    <a
-                        class="btn"
-                        href="/group/{{ group_id }}"
-                    >
-                        Back to Group
-                    </a>
-
-                </div>
-
-            </div>
-
-            """,
-            name=user["name"],
-            group_id=group_id
+        return redirect(
+            url_for("group_detail", group_id=group_id)
         )
 
-    last_position = conn.execute("""
-        SELECT MAX(position) AS position
-        FROM members
-        WHERE group_id=?
-    """, (group_id,)).fetchone()
-
-    next_position = (
-        last_position["position"] or 0
-    ) + 1
-
-    conn.execute("""
-        INSERT INTO members
-        (
-            group_id,
-            user_id,
-            position,
-            joined_at
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        group_id,
-        user["id"],
-        next_position,
-        datetime.now().isoformat()
-    ))
-
-    conn.commit()
     conn.close()
 
-    return redirect(
-        url_for(
-            "group",
-            group_id=group_id
-        )
-    )
+    content = f"""
+    <div class="card">
+
+        <h2>➕ Add Member</h2>
+
+        <p>
+            Group:
+            <strong>{group["name"]}</strong>
+        </p>
+
+        <form method="POST">
+
+            <label>Member Name</label>
+            <input
+                type="text"
+                name="name"
+                placeholder="Full name"
+                required
+            >
+
+            <label>Phone Number</label>
+            <input
+                type="text"
+                name="phone"
+                placeholder="080..."
+            >
+
+            <label>Email</label>
+            <input
+                type="email"
+                name="email"
+                placeholder="member@email.com"
+            >
+
+            <button class="btn" type="submit">
+                Add Member
+            </button>
+
+        </form>
+
+    </div>
+    """
+
+    return page("Add Member", content)
 
 
 # ============================================================
@@ -1453,357 +1258,476 @@ def add_member(group_id):
 # ============================================================
 
 @app.route(
-    "/group/<int:group_id>/contribution",
-    methods=["POST"]
+    "/group/<int:group_id>/member/<int:member_id>/contribute",
+    methods=["GET", "POST"]
 )
 @login_required
-def contribution(group_id):
-
-    member_id = request.form.get(
-        "member_id"
-    )
-
-    amount_text = request.form.get(
-        "amount"
-    )
+def record_contribution(group_id, member_id):
 
     conn = get_db()
 
-    # Only group owner can record payments
-    group_data = conn.execute("""
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
+
+    member = conn.execute(
+        """
         SELECT *
-        FROM groups
-        WHERE id=? AND creator_id=?
-    """, (
-        group_id,
-        session["user_id"]
-    )).fetchone()
-
-    if not group_data:
-
-        conn.close()
-
-        return (
-            "Only the group administrator "
-            "can record contributions.",
-            403
-        )
-
-    try:
-
-        amount = float(amount_text)
-
-        if amount <= 0:
-            raise ValueError
-
-    except (ValueError, TypeError):
-
-        conn.close()
-
-        return "Invalid contribution amount.", 400
-
-    # Make sure the member belongs to this group
-    member = conn.execute("""
-        SELECT id
         FROM members
-        WHERE id=? AND group_id=?
-    """, (
-        member_id,
-        group_id
-    )).fetchone()
+        WHERE id = ?
+        AND group_id = ?
+        """,
+        (member_id, group_id)
+    ).fetchone()
 
-    if not member:
+    if not group or not member:
+        conn.close()
+        return "Member or group not found", 404
 
+    if request.method == "POST":
+
+        amount = request.form.get(
+            "amount",
+            str(group["contribution"])
+        )
+
+        payment_date = request.form.get(
+            "payment_date",
+            datetime.now().strftime("%Y-%m-%d")
+        )
+
+        note = request.form.get("note", "").strip()
+
+        try:
+            amount = float(amount)
+        except ValueError:
+            conn.close()
+            flash("Invalid contribution amount.")
+            return redirect(
+                url_for(
+                    "record_contribution",
+                    group_id=group_id,
+                    member_id=member_id
+                )
+            )
+
+        conn.execute(
+            """
+            INSERT INTO contributions
+            (group_id, member_id, amount, payment_date, status, note)
+            VALUES (?, ?, ?, ?, 'paid', ?)
+            """,
+            (
+                group_id,
+                member_id,
+                amount,
+                payment_date,
+                note
+            )
+        )
+
+        conn.commit()
         conn.close()
 
-        return "Invalid group member.", 400
-
-    conn.execute("""
-        INSERT INTO contributions
-        (
-            group_id,
-            member_id,
-            amount,
-            date,
-            status
+        flash(
+            f"Payment of {money(amount)} recorded for {member['name']}."
         )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        group_id,
-        member_id,
-        amount,
-        datetime.now().strftime("%Y-%m-%d"),
-        "Paid"
-    ))
 
-    conn.commit()
+        return redirect(
+            url_for(
+                "group_detail",
+                group_id=group_id
+            )
+        )
+
     conn.close()
 
-    return redirect(
-        url_for(
-            "group",
-            group_id=group_id
-        )
-    )
+    content = f"""
+    <div class="card">
+
+        <h2>💰 Record Contribution</h2>
+
+        <p>
+            Member:
+            <strong>{member["name"]}</strong>
+        </p>
+
+        <p>
+            Expected contribution:
+            <strong>{money(group["contribution"])}</strong>
+        </p>
+
+        <form method="POST">
+
+            <label>Amount Paid</label>
+            <input
+                type="number"
+                name="amount"
+                value="{group["contribution"]}"
+                min="0"
+                step="0.01"
+                required
+            >
+
+            <label>Payment Date</label>
+            <input
+                type="date"
+                name="payment_date"
+                value="{datetime.now().strftime("%Y-%m-%d")}"
+                required
+            >
+
+            <label>Note</label>
+            <textarea
+                name="note"
+                placeholder="Optional note"
+            ></textarea>
+
+            <button class="btn" type="submit">
+                Record Payment
+            </button>
+
+        </form>
+
+    </div>
+    """
+
+    return page("Record Contribution", content)
 
 
 # ============================================================
-# ROTATION SCHEDULE
+# CONTRIBUTIONS
 # ============================================================
 
-@app.route(
-    "/group/<int:group_id>/rotation"
-)
+@app.route("/group/<int:group_id>/contributions")
 @login_required
-def rotation(group_id):
-
-    user_id = session["user_id"]
+def contributions(group_id):
 
     conn = get_db()
 
-    group_data = conn.execute("""
-        SELECT *
-        FROM groups
-        WHERE id=?
-    """, (group_id,)).fetchone()
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
 
-    if not group_data:
-
-        conn.close()
-
-        return "Group not found.", 404
-
-    allowed = user_is_group_member(
-        conn,
-        group_id,
-        user_id
-    )
-
-    if not allowed and group_data["creator_id"] != user_id:
-
-        conn.close()
-
-        return (
-            "You are not a member of this group.",
-            403
-        )
-
-    members = conn.execute("""
+    records = conn.execute(
+        """
         SELECT
-            members.id AS member_id,
-            members.position,
-            users.name,
-            users.phone
-        FROM members
-        JOIN users
-            ON users.id = members.user_id
-        WHERE members.group_id=?
-        ORDER BY members.position
-    """, (group_id,)).fetchall()
+            contributions.*,
+            members.name AS member_name
+        FROM contributions
+        JOIN members
+            ON members.id = contributions.member_id
+        WHERE contributions.group_id = ?
+        ORDER BY contributions.payment_date DESC,
+                 contributions.id DESC
+        """,
+        (group_id,)
+    ).fetchall()
 
     conn.close()
 
-    schedule = get_rotation_schedule(
-        group_data,
-        members
-    )
+    content = f"""
+    <div class="card">
 
-    total_members = len(members)
+        <h2>💰 Contribution History</h2>
 
-    payout_amount = (
-        group_data["contribution"]
-        * total_members
-    )
+        <p>
+            Group:
+            <strong>{group["name"]}</strong>
+        </p>
 
-    return render_template_string(
-        STYLE + """
+        <div class="table-wrap">
 
-        <nav>
+        <table>
 
-            <a href="/dashboard">
-                Dashboard
-            </a>
+            <tr>
+                <th>Member</th>
+                <th>Amount</th>
+                <th>Date</th>
+                <th>Status</th>
+                <th>Note</th>
+            </tr>
+    """
 
-            <a href="/group/{{ group['id'] }}">
-                Group
-            </a>
+    for row in records:
 
-            <a href="/logout">
-                Logout
-            </a>
+        content += f"""
+        <tr>
 
-        </nav>
+            <td>{row["member_name"]}</td>
 
-        <div class="container">
+            <td>
+                <strong>{money(row["amount"])}</strong>
+            </td>
 
-            <div class="card">
+            <td>{row["payment_date"]}</td>
 
-                <h1>
-                    🔄 Ajo Rotation Schedule
-                </h1>
+            <td>
+                <span class="badge paid">
+                    {row["status"].title()}
+                </span>
+            </td>
 
-                <h2>
-                    {{ group["name"] }}
-                </h2>
+            <td>{row["note"] or "-"}</td>
 
-                <p>
-                    Contribution:
-                    <strong>
-                    ₦{{ "{:,.2f}".format(
-                        group["contribution"]
-                    ) }}
-                    </strong>
-                </p>
+        </tr>
+        """
 
-                <p>
-                    Members:
-                    <strong>
-                        {{ total_members }}
-                    </strong>
-                </p>
-
-                <p>
-                    Expected payout each round:
-                    <strong>
-                    ₦{{ "{:,.2f}".format(
-                        payout_amount
-                    ) }}
-                    </strong>
-                </p>
-
-                <div class="info">
-
-                    Each member receives the
-                    collected contribution according
-                    to their rotation position.
-
-                </div>
-
-            </div>
-
-
-            <div class="card">
-
-                <h2>
-                    📅 Rotation Order
-                </h2>
-
-                {% if schedule %}
-
-                <table>
-
-                    <tr>
-
-                        <th>
-                            Round
-                        </th>
-
-                        <th>
-                            Recipient
-                        </th>
-
-                        <th>
-                            Position
-                        </th>
-
-                        <th>
-                            Date
-                        </th>
-
-                        <th>
-                            Expected Payout
-                        </th>
-
-                    </tr>
-
-                    {% for item in schedule %}
-
-                    <tr>
-
-                        <td>
-                            {{ item["round"] }}
-                        </td>
-
-                        <td>
-                            <strong>
-                                {{ item["member_name"] }}
-                            </strong>
-
-                            <br>
-
-                            <span class="small">
-                                {{ item["phone"] }}
-                            </span>
-                        </td>
-
-                        <td>
-                            {{ item["position"] }}
-                        </td>
-
-                        <td>
-                            {{ item["date"] }}
-                        </td>
-
-                        <td>
-                            ₦{{ "{:,.2f}".format(
-                                item["amount"]
-                            ) }}
-                        </td>
-
-                    </tr>
-
-                    {% endfor %}
-
-                </table>
-
-                {% else %}
-
-                <p>
-                    No members have been added yet.
-                </p>
-
-                {% endif %}
-
-            </div>
-
-
-            <div class="card">
-
-                <h2>
-                    ℹ️ How the Rotation Works
-                </h2>
-
-                <p>
-                    <strong>Round 1:</strong>
-                    Position 1 receives.
-                </p>
-
-                <p>
-                    <strong>Round 2:</strong>
-                    Position 2 receives.
-                </p>
-
-                <p>
-                    <strong>Round 3:</strong>
-                    Position 3 receives.
-                </p>
-
-                <p>
-                    The process continues until
-                    every member has received one
-                    payout.
-                </p>
-
-            </div>
+    content += """
+        </table>
 
         </div>
 
+    </div>
+    """
+
+    return page("Contributions", content)
+
+
+# ============================================================
+# RECORD PAYOUT
+# ============================================================
+
+@app.route(
+    "/group/<int:group_id>/member/<int:member_id>/payout",
+    methods=["GET", "POST"]
+)
+@login_required
+def record_payout(group_id, member_id):
+
+    conn = get_db()
+
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
+
+    member = conn.execute(
+        """
+        SELECT *
+        FROM members
+        WHERE id = ?
+        AND group_id = ?
         """,
-        group=group_data,
-        schedule=schedule,
-        total_members=total_members,
-        payout_amount=payout_amount
-    )
+        (member_id, group_id)
+    ).fetchone()
+
+    if not group or not member:
+        conn.close()
+        return "Member or group not found", 404
+
+    member_count = conn.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM members
+        WHERE group_id = ?
+        AND status = 'active'
+        """,
+        (group_id,)
+    ).fetchone()["total"]
+
+    expected_payout = group["contribution"] * member_count
+
+    if request.method == "POST":
+
+        amount = request.form.get(
+            "amount",
+            str(expected_payout)
+        )
+
+        payout_date = request.form.get(
+            "payout_date",
+            datetime.now().strftime("%Y-%m-%d")
+        )
+
+        note = request.form.get("note", "").strip()
+
+        try:
+            amount = float(amount)
+        except ValueError:
+            conn.close()
+            flash("Invalid payout amount.")
+            return redirect(
+                url_for(
+                    "record_payout",
+                    group_id=group_id,
+                    member_id=member_id
+                )
+            )
+
+        conn.execute(
+            """
+            INSERT INTO payouts
+            (group_id, member_id, amount, payout_date, status, note)
+            VALUES (?, ?, ?, ?, 'paid', ?)
+            """,
+            (
+                group_id,
+                member_id,
+                amount,
+                payout_date,
+                note
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        flash(
+            f"Payout of {money(amount)} recorded for {member['name']}."
+        )
+
+        return redirect(
+            url_for(
+                "group_detail",
+                group_id=group_id
+            )
+        )
+
+    conn.close()
+
+    content = f"""
+    <div class="card">
+
+        <h2>💸 Record Payout</h2>
+
+        <p>
+            Beneficiary:
+            <strong>{member["name"]}</strong>
+        </p>
+
+        <p>
+            Expected payout:
+            <strong>{money(expected_payout)}</strong>
+        </p>
+
+        <form method="POST">
+
+            <label>Payout Amount</label>
+            <input
+                type="number"
+                name="amount"
+                value="{expected_payout}"
+                min="0"
+                step="0.01"
+                required
+            >
+
+            <label>Payout Date</label>
+            <input
+                type="date"
+                name="payout_date"
+                value="{datetime.now().strftime("%Y-%m-%d")}"
+                required
+            >
+
+            <label>Note</label>
+            <textarea
+                name="note"
+                placeholder="Optional payout note"
+            ></textarea>
+
+            <button class="btn btn-warning" type="submit">
+                Confirm Payout
+            </button>
+
+        </form>
+
+    </div>
+    """
+
+    return page("Record Payout", content)
+
+
+# ============================================================
+# PAYOUT HISTORY
+# ============================================================
+
+@app.route("/group/<int:group_id>/payouts")
+@login_required
+def payouts(group_id):
+
+    conn = get_db()
+
+    group = conn.execute(
+        "SELECT * FROM groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
+
+    records = conn.execute(
+        """
+        SELECT
+            payouts.*,
+            members.name AS member_name
+        FROM payouts
+        JOIN members
+            ON members.id = payouts.member_id
+        WHERE payouts.group_id = ?
+        ORDER BY payouts.id DESC
+        """,
+        (group_id,)
+    ).fetchall()
+
+    conn.close()
+
+    content = f"""
+    <div class="card">
+
+        <h2>💸 Payout History</h2>
+
+        <p>
+            Group:
+            <strong>{group["name"]}</strong>
+        </p>
+
+        <div class="table-wrap">
+
+        <table>
+
+            <tr>
+                <th>Beneficiary</th>
+                <th>Amount</th>
+                <th>Date</th>
+                <th>Status</th>
+                <th>Note</th>
+            </tr>
+    """
+
+    for row in records:
+
+        content += f"""
+        <tr>
+
+            <td>{row["member_name"]}</td>
+
+            <td>
+                <strong>{money(row["amount"])}</strong>
+            </td>
+
+            <td>{row["payout_date"] or "-"}</td>
+
+            <td>
+                <span class="badge success">
+                    {row["status"].title()}
+                </span>
+            </td>
+
+            <td>{row["note"] or "-"}</td>
+
+        </tr>
+        """
+
+    content += """
+        </table>
+
+        </div>
+
+    </div>
+    """
+
+    return page("Payouts", content)
 
 
 # ============================================================
@@ -1812,25 +1736,22 @@ def rotation(group_id):
 
 @app.route("/health")
 def health():
-
-    return "AjoConnect is running!"
+    return {
+        "status": "ok",
+        "app": "AjoConnect"
+    }
 
 
 # ============================================================
-# START APPLICATION
+# RUN
 # ============================================================
-
-init_db()
-
 
 if __name__ == "__main__":
 
+    port = int(os.environ.get("PORT", 5000))
+
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                5000
-            )
-        )
+        port=port,
+        debug=False
     )
