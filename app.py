@@ -447,6 +447,29 @@ BASE_HTML = """
             gap: 8px;
             flex-wrap: wrap;
         }
+        .member-row {
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+        .member-row:hover {
+            background: #f7faf9;
+        }
+        .member-row td {
+            vertical-align: middle;
+        }
+        .member-link {
+            color: inherit;
+            text-decoration: none;
+            display: block;
+        }
+        .member-link strong {
+            text-decoration: underline;
+            text-decoration-thickness: 1px;
+            text-underline-offset: 3px;
+        }
+        .view-member {
+            white-space: nowrap;
+        }
         .premium-box {
             border: 2px solid #d8a63a;
             background: #fffaf0;
@@ -455,6 +478,12 @@ BASE_HTML = """
             text-align: center;
             padding: 30px;
             color: #777;
+        }
+        .member-link small {
+            display: block;
+            margin-top: 3px;
+            color: #777;
+            font-size: 11px;
         }
         @media(max-width: 600px) {
             nav { display: block; }
@@ -1284,14 +1313,20 @@ def group_detail(group_id):
 
     for member in members:
         content += f"""
-        <tr>
+        <tr class="member-row" onclick="window.location.href='/group/{group_id}/member/{member["id"]}'">
             <td>{member["position"]}</td>
-            <td><strong>{member["name"]}</strong></td>
+            <td>
+                <a class="member-link" href="/group/{group_id}/member/{member["id"]}">
+                    <strong>{member["name"]}</strong>
+                    <small>Tap to view details</small>
+                </a>
+            </td>
             <td>{member["phone"] or "-"}</td>
             <td><span class="badge success">{member["status"].title()}</span></td>
             <td>{money(expected_payout)}</td>
             <td>
                 <div class="actions">
+                    <a class="btn view-member" href="/group/{group_id}/member/{member["id"]}">View Details</a>
                     <a class="btn" href="/group/{group_id}/member/{member["id"]}/contribute">Payment</a>
                     <a class="btn btn-warning" href="/group/{group_id}/member/{member["id"]}/payout">Payout</a>
                 </div>
@@ -1309,7 +1344,160 @@ def group_detail(group_id):
 
 
 # ============================================================
+# MEMBER DETAILS
+# ============================================================
+
+@app.route("/group/<int:group_id>/member/<int:member_id>")
+@login_required
+def member_detail(group_id, member_id):
+    group = group_belongs_to_user(group_id, session["user_id"])
+    if not group:
+        return "Group not found", 404
+
+    conn = get_db()
+    member = conn.execute(
+        "SELECT * FROM members WHERE id = ? AND group_id = ?",
+        (member_id, group_id)
+    ).fetchone()
+
+    if not member:
+        conn.close()
+        return "Member not found", 404
+
+    contribution_rows = conn.execute(
+        """
+        SELECT amount, payment_date, status, note
+        FROM contributions
+        WHERE group_id = ? AND member_id = ?
+        ORDER BY payment_date DESC, id DESC
+        """,
+        (group_id, member_id)
+    ).fetchall()
+
+    payout_rows = conn.execute(
+        """
+        SELECT amount, payout_date, status, note
+        FROM payouts
+        WHERE group_id = ? AND member_id = ?
+        ORDER BY payout_date DESC, id DESC
+        """,
+        (group_id, member_id)
+    ).fetchall()
+
+    contribution_total = sum(float(row["amount"] or 0) for row in contribution_rows)
+    payout_total = sum(float(row["amount"] or 0) for row in payout_rows if row["status"] == "paid")
+    expected_payout = group["contribution"] * conn.execute(
+        "SELECT COUNT(*) FROM members WHERE group_id = ? AND status = 'active'",
+        (group_id,)
+    ).fetchone()[0]
+    conn.close()
+
+    content = f"""
+    <div class="hero">
+        <h1>👤 {member["name"]}</h1>
+        <p>Member details for <strong>{group["name"]}</strong></p>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>Position</h3>
+            <div class="stat">#{member["position"]}</div>
+        </div>
+        <div class="card">
+            <h3>Phone</h3>
+            <div class="stat">{member["phone"] or "-"}</div>
+        </div>
+        <div class="card">
+            <h3>Status</h3>
+            <div class="stat">{member["status"].title()}</div>
+        </div>
+        <div class="card">
+            <h3>Total Contributions</h3>
+            <div class="stat">{money(contribution_total)}</div>
+        </div>
+        <div class="card">
+            <h3>Total Payout Received</h3>
+            <div class="stat">{money(payout_total)}</div>
+        </div>
+        <div class="card">
+            <h3>Expected Payout</h3>
+            <div class="stat">{money(expected_payout)}</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>📋 Member Information</h2>
+        <p><strong>Name:</strong> {member["name"]}</p>
+        <p><strong>Phone:</strong> {member["phone"] or "Not provided"}</p>
+        <p><strong>Email:</strong> {member["email"] or "Not provided"}</p>
+        <p><strong>Rotation Position:</strong> {member["position"]}</p>
+        <p><strong>Status:</strong> <span class="badge success">{member["status"].title()}</span></p>
+        <p><strong>Joined:</strong> {member["created_at"]}</p>
+        <div class="actions">
+            <a class="btn" href="/group/{group_id}/member/{member_id}/contribute">💰 Record Contribution</a>
+            <a class="btn btn-warning" href="/group/{group_id}/member/{member_id}/payout">💸 Record Payout</a>
+            <a class="btn btn-secondary" href="/group/{group_id}">← Back to Rotation</a>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>💰 Contribution History</h2>
+        <div class="table-wrap">
+        <table>
+            <tr><th>Amount</th><th>Date</th><th>Status</th><th>Note</th></tr>
+    """
+
+    if contribution_rows:
+        for row in contribution_rows:
+            content += f"""
+            <tr>
+                <td><strong>{money(row["amount"])}</strong></td>
+                <td>{row["payment_date"]}</td>
+                <td><span class="badge paid">{row["status"].title()}</span></td>
+                <td>{row["note"] or "-"}</td>
+            </tr>
+            """
+    else:
+        content += '<tr><td colspan="4">No contribution recorded yet.</td></tr>'
+
+    content += """
+        </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>💸 Payout History</h2>
+        <div class="table-wrap">
+        <table>
+            <tr><th>Amount</th><th>Date</th><th>Status</th><th>Note</th></tr>
+    """
+
+    if payout_rows:
+        for row in payout_rows:
+            badge_class = "paid" if row["status"] == "paid" else "pending"
+            content += f"""
+            <tr>
+                <td><strong>{money(row["amount"])}</strong></td>
+                <td>{row["payout_date"] or "-"}</td>
+                <td><span class="badge {badge_class}">{row["status"].title()}</span></td>
+                <td>{row["note"] or "-"}</td>
+            </tr>
+            """
+    else:
+        content += '<tr><td colspan="4">No payout recorded yet.</td></tr>'
+
+    content += """
+        </table>
+        </div>
+    </div>
+    """
+
+    return page(member["name"], content)
+
+
+# ============================================================
 # ADD MEMBER
+
 # ============================================================
 
 @app.route("/group/<int:group_id>/member/add", methods=["GET", "POST"])
