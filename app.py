@@ -109,10 +109,35 @@ def init_db():
     );
     """)
 
-    # Upgrade existing databases created by the earlier AjoConnect version.
-    add_column_if_missing(conn, "groups", "user_id", "INTEGER")
+    # Upgrade existing databases created by earlier AjoConnect versions.
+    # These migrations are deliberately additive so existing groups, members,
+    # contributions and payouts are not deleted.
+    add_column_if_missing(conn, "users", "email", "TEXT")
+    add_column_if_missing(conn, "users", "role", "TEXT NOT NULL DEFAULT 'admin'")
+    add_column_if_missing(conn, "users", "created_at", "TEXT")
     add_column_if_missing(conn, "users", "plan", "TEXT NOT NULL DEFAULT 'free'")
     add_column_if_missing(conn, "users", "premium_until", "TEXT")
+    add_column_if_missing(conn, "groups", "user_id", "INTEGER")
+    add_column_if_missing(conn, "groups", "created_at", "TEXT")
+    add_column_if_missing(conn, "members", "email", "TEXT")
+    add_column_if_missing(conn, "members", "status", "TEXT NOT NULL DEFAULT 'active'")
+    add_column_if_missing(conn, "members", "created_at", "TEXT")
+    add_column_if_missing(conn, "contributions", "status", "TEXT NOT NULL DEFAULT 'paid'")
+    add_column_if_missing(conn, "contributions", "note", "TEXT")
+    add_column_if_missing(conn, "payouts", "status", "TEXT NOT NULL DEFAULT 'pending'")
+    add_column_if_missing(conn, "payouts", "note", "TEXT")
+    add_column_if_missing(conn, "subscriptions", "started_at", "TEXT")
+    add_column_if_missing(conn, "subscriptions", "expires_at", "TEXT")
+
+    # Give migrated rows sensible defaults where older schemas did not have them.
+    conn.execute("UPDATE users SET role = 'admin' WHERE role IS NULL OR role = ''")
+    conn.execute("UPDATE users SET plan = 'free' WHERE plan IS NULL OR plan = ''")
+    conn.execute("UPDATE users SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.execute("UPDATE groups SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.execute("UPDATE members SET status = 'active' WHERE status IS NULL OR status = ''")
+    conn.execute("UPDATE members SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.execute("UPDATE contributions SET status = 'paid' WHERE status IS NULL OR status = ''")
+    conn.execute("UPDATE payouts SET status = 'pending' WHERE status IS NULL OR status = ''")
 
     # Existing groups from the prototype are assigned to the first admin.
     first_user = conn.execute(
@@ -124,9 +149,6 @@ def init_db():
             "UPDATE groups SET user_id = ? WHERE user_id IS NULL",
             (first_user["id"],)
         )
-        # Older AjoConnect builds accidentally marked every registered user as admin.
-        conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (first_user["id"],))
-        conn.execute("UPDATE users SET role = 'user' WHERE id != ?", (first_user["id"],))
 
     conn.commit()
     conn.close()
@@ -183,8 +205,15 @@ def refresh_session_plan():
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if "user_id" not in session:
+        user = current_user()
+        if user is None:
+            # Prevent stale/deleted sessions from causing 500 errors.
+            session.clear()
+            flash("Your session has expired. Please log in again.")
             return redirect(url_for("login"))
+        session["user_id"] = user["id"]
+        session["name"] = user["name"]
+        session["role"] = user["role"]
         refresh_session_plan()
         return view(*args, **kwargs)
     return wrapped
@@ -193,25 +222,35 @@ def login_required(view):
 def admin_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if "user_id" not in session:
+        user = current_user()
+        if user is None:
+            session.clear()
+            flash("Your session has expired. Please log in again.")
             return redirect(url_for("login"))
-        if session.get("role") != "admin":
+        if user["role"] != "admin":
             return redirect(url_for("dashboard"))
+        session["user_id"] = user["id"]
+        session["name"] = user["name"]
+        session["role"] = user["role"]
         refresh_session_plan()
         return view(*args, **kwargs)
     return wrapped
 
 
 def current_user():
-    if "user_id" not in session:
+    """Return the logged-in user, or None if the session is stale."""
+    user_id = session.get("user_id")
+    if not user_id:
         return None
     conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE id = ?",
-        (session["user_id"],)
-    ).fetchone()
-    conn.close()
-    return user
+    try:
+        user = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+        return user
+    finally:
+        conn.close()
 
 
 def group_belongs_to_user(group_id, user_id):
@@ -225,102 +264,95 @@ def group_belongs_to_user(group_id, user_id):
 
 
 def paystack_request(path, method="GET", payload=None):
-    secret = os.environ.get("PAYSTACK_SECRET_KEY")
-
+    """Call Paystack safely and return (result, error)."""
+    secret = (os.environ.get("PAYSTACK_SECRET_KEY") or "").strip()
     if not secret:
         return None, "PAYSTACK_SECRET_KEY is not configured in Render."
+    if not secret.startswith(("sk_live_", "sk_test_")):
+        return None, "PAYSTACK_SECRET_KEY must start with sk_live_ or sk_test_."
 
     url = "https://api.paystack.co" + path
-
     headers = {
         "Authorization": "Bearer " + secret,
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers=headers,
-        method=method
-    )
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8")), None
+            body = response.read().decode("utf-8")
+            result = json.loads(body)
+            if not result.get("status"):
+                return result, result.get("message", "Paystack rejected the request.")
+            return result, None
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8")
+            parsed = json.loads(body)
+            message = parsed.get("message") or body
         except Exception:
-            body = str(e)
-        return None, f"Paystack HTTP error: {e.code} {body}"
+            message = str(e)
+        return None, f"Paystack error ({e.code}): {message}"
+    except urllib.error.URLError as e:
+        return None, f"Could not connect to Paystack: {e.reason}"
     except Exception as e:
         return None, f"Payment connection error: {e}"
 
 
 def activate_premium(user_id, reference):
+    """Idempotently mark a verified Premium transaction as paid."""
     conn = get_db()
+    try:
+        subscription = conn.execute(
+            "SELECT * FROM subscriptions WHERE reference = ? AND user_id = ?",
+            (reference, user_id)
+        ).fetchone()
+        if not subscription:
+            return False
+        if subscription["status"] == "paid":
+            return True
 
-    existing = conn.execute(
-        "SELECT id FROM subscriptions WHERE reference = ?",
-        (reference,)
-    ).fetchone()
+        user = conn.execute(
+            "SELECT premium_until FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+        if not user:
+            return False
 
-    if existing:
-        conn.close()
-        return False
+        start = datetime.now()
+        if user["premium_until"]:
+            try:
+                old_expiry = datetime.strptime(user["premium_until"], "%Y-%m-%d %H:%M:%S")
+                if old_expiry > start:
+                    start = old_expiry
+            except (ValueError, TypeError):
+                pass
 
-    user = conn.execute(
-        "SELECT premium_until FROM users WHERE id = ?",
-        (user_id,)
-    ).fetchone()
+        expiry = start + timedelta(days=30)
+        started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        expires = expiry.strftime("%Y-%m-%d %H:%M:%S")
 
-    start = datetime.now()
-
-    if user and user["premium_until"]:
-        try:
-            old_expiry = datetime.strptime(
-                user["premium_until"], "%Y-%m-%d %H:%M:%S"
-            )
-            if old_expiry > start:
-                start = old_expiry
-        except ValueError:
-            pass
-
-    expiry = start + timedelta(days=30)
-
-    conn.execute(
-        """
-        INSERT INTO subscriptions
-        (user_id, plan, amount, reference, status, started_at, expires_at, created_at)
-        VALUES (?, 'premium', ?, ?, 'paid', ?, ?, ?)
-        """,
-        (
-            user_id,
-            PREMIUM_PRICE,
-            reference,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            expiry.strftime("%Y-%m-%d %H:%M:%S"),
-            now()
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET status = 'paid', started_at = ?, expires_at = ?
+            WHERE reference = ? AND user_id = ?
+            """,
+            (started, expires, reference, user_id)
         )
-    )
-
-    conn.execute(
-        """
-        UPDATE users
-        SET plan = 'premium', premium_until = ?
-        WHERE id = ?
-        """,
-        (expiry.strftime("%Y-%m-%d %H:%M:%S"), user_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return True
+        conn.execute(
+            "UPDATE users SET plan = 'premium', premium_until = ? WHERE id = ?",
+            (expires, user_id)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -477,24 +509,6 @@ BASE_HTML = """
             border: 2px solid #d8a63a;
             background: #fffaf0;
         }
-.ad-box {
-            border: 1px dashed #bbb;
-            background: #fafafa;
-            text-align: center;
-            color: #666;
-        }
-        .ad-label {
-            font-size: 11px;
-            letter-spacing: 1px;
-            font-weight: bold;
-            color: #999;
-            margin-bottom: 5px;
-        }
-        .notice {
-            border-left: 4px solid #075e54;
-            background: #eef8f6;
-        }
-
         footer {
             text-align: center;
             padding: 30px;
@@ -548,25 +562,7 @@ BASE_HTML = """
 """
 
 
-def ad_slot():
-    """Simple ad placeholder. Replace this block later with AdSense/other ad code."""
-    if session.get("premium"):
-        return ""
-    return """
-    <div class="card ad-box">
-        <div class="ad-label">ADVERTISEMENT</div>
-        <p>Support AjoConnect by checking out our sponsors.</p>
-    </div>
-    """
-
-
 def page(title, content):
-    if "user_id" not in session:
-        ad = ad_slot()
-    else:
-        refresh_session_plan()
-        ad = ad_slot()
-    content = content + ad
     return render_template_string(
         BASE_HTML,
         title=title,
@@ -609,11 +605,6 @@ def home():
             <p>Unlock unlimited groups, members and advanced features for ₦2,000/month.</p>
         </div>
     </div>
-
-    <div class="card notice">
-        <h3>🔐 Your money stays with you</h3>
-        <p>AjoConnect does not collect, hold, or control members' Ajo funds. Groups arrange payments and payouts directly between members or through their chosen payment provider. AjoConnect only helps you organize and record the Ajo.</p>
-    </div>
     """
     return page("Home", content)
 
@@ -644,17 +635,13 @@ def register():
             flash("An account with this email already exists.")
             return redirect(url_for("login"))
 
-        # The first account is the platform owner/admin. Every later account is a normal user.
-        existing_users = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
-        role = "admin" if existing_users == 0 else "user"
-
         conn.execute(
             """
             INSERT INTO users
             (name, email, password, role, plan, created_at)
-            VALUES (?, ?, ?, ?, 'free', ?)
+            VALUES (?, ?, ?, 'admin', 'free', ?)
             """,
-            (name, email, generate_password_hash(password), role, now())
+            (name, email, generate_password_hash(password), now())
         )
         conn.commit()
         conn.close()
@@ -738,6 +725,10 @@ def logout():
 def subscription():
     refresh_session_plan()
     user = current_user()
+    if user is None:
+        session.clear()
+        flash("Your session has expired. Please log in again.")
+        return redirect(url_for("login"))
 
     if is_premium_user(user["id"]):
         expiry = user["premium_until"]
@@ -789,115 +780,112 @@ def subscription():
 @login_required
 def pay_premium():
     user = current_user()
+    if user is None:
+        session.clear()
+        flash("Your session has expired. Please log in again.")
+        return redirect(url_for("login"))
 
     if is_premium_user(user["id"]):
         flash("Your Premium membership is already active.")
         return redirect(url_for("subscription"))
 
+    email = (user["email"] or "").strip().lower()
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        flash("Please update your account with a valid email address before paying.")
+        return redirect(url_for("subscription"))
+
     reference = "AJOCONNECT-" + uuid.uuid4().hex.upper()
-
     conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO subscriptions
-        (user_id, plan, amount, reference, status, created_at)
-        VALUES (?, 'premium', ?, ?, 'pending', ?)
-        """,
-        (user["id"], PREMIUM_PRICE, reference, now())
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO subscriptions
+            (user_id, plan, amount, reference, status, created_at)
+            VALUES (?, 'premium', ?, ?, 'pending', ?)
+            """,
+            (user["id"], PREMIUM_PRICE, reference, now())
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
-    # Paystack expects NGN amount in kobo, so ₦2,000 = 200,000.
     payload = {
-        "email": user["email"],
-        "amount": PREMIUM_PRICE * 100,
+        "email": email,
+        "amount": int(PREMIUM_PRICE * 100),
         "currency": "NGN",
         "reference": reference,
         "callback_url": request.host_url.rstrip("/") + url_for("paystack_callback"),
-        "metadata": json.dumps({
+        "metadata": {
             "user_id": user["id"],
             "product": "AjoConnect Premium"
-        })
+        }
     }
 
-    result, error = paystack_request(
-        "/transaction/initialize",
-        method="POST",
-        payload=payload
-    )
-
+    result, error = paystack_request("/transaction/initialize", "POST", payload)
     if error or not result or not result.get("status"):
         conn = get_db()
-        conn.execute(
-            "UPDATE subscriptions SET status = 'failed' WHERE reference = ?",
-            (reference,)
-        )
-        conn.commit()
-        conn.close()
-
-        flash("We could not start the payment. Please try again.")
+        try:
+            conn.execute("UPDATE subscriptions SET status = 'failed' WHERE reference = ?", (reference,))
+            conn.commit()
+        finally:
+            conn.close()
+        flash("Payment could not be started: " + (error or "Paystack returned an invalid response."))
         return redirect(url_for("subscription"))
 
-    authorization_url = result["data"]["authorization_url"]
+    authorization_url = (result.get("data") or {}).get("authorization_url")
+    if not authorization_url:
+        flash("Payment could not be started because Paystack returned no checkout link.")
+        return redirect(url_for("subscription"))
+
     return redirect(authorization_url)
 
 
 @app.route("/paystack/callback")
-@login_required
 def paystack_callback():
+    """Verify Paystack payment without requiring an existing browser session."""
     reference = request.args.get("reference", "").strip()
-
     if not reference:
         flash("No payment reference was received.")
-        return redirect(url_for("subscription"))
+        return redirect(url_for("login"))
 
-    user = current_user()
+    result, error = paystack_request("/transaction/verify/" + reference)
+    if error or not result or not result.get("status"):
+        flash("Payment could not be verified: " + (error or "Paystack returned an invalid response."))
+        return redirect(url_for("subscription")) if current_user() else redirect(url_for("login"))
 
+    transaction = result.get("data") or {}
     conn = get_db()
-    subscription = conn.execute(
-        """
-        SELECT *
-        FROM subscriptions
-        WHERE reference = ?
-        AND user_id = ?
-        """,
-        (reference, user["id"])
-    ).fetchone()
-    conn.close()
+    try:
+        subscription = conn.execute(
+            "SELECT * FROM subscriptions WHERE reference = ?",
+            (reference,)
+        ).fetchone()
+    finally:
+        conn.close()
 
     if not subscription:
         flash("Payment record not found.")
-        return redirect(url_for("subscription"))
+        return redirect(url_for("login"))
 
-    result, error = paystack_request(
-        "/transaction/verify/" + reference
-    )
-
-    if error or not result or not result.get("status"):
-        flash("Payment could not be verified yet. Please try again.")
-        return redirect(url_for("subscription"))
-
-    transaction = result.get("data", {})
-
-    paid_amount = transaction.get("amount")
-    currency = transaction.get("currency")
-    payment_status = transaction.get("status")
-
-    expected_amount = PREMIUM_PRICE * 100
-
+    expected_amount = int(PREMIUM_PRICE * 100)
     if (
-        payment_status == "success"
-        and currency == "NGN"
-        and paid_amount == expected_amount
+        transaction.get("status") == "success"
+        and transaction.get("currency") == "NGN"
+        and int(transaction.get("amount") or 0) == expected_amount
     ):
-        activate_premium(user["id"], reference)
-        session["premium"] = True
-        flash("Payment successful! Your Premium account is now active for 30 days.")
-        return redirect(url_for("subscription"))
+        if activate_premium(subscription["user_id"], reference):
+            session.clear()
+            session["user_id"] = subscription["user_id"]
+            user = current_user()
+            if user:
+                session["name"] = user["name"]
+                session["role"] = user["role"]
+                session["premium"] = True
+            flash("Payment successful! Your Premium account is now active for 30 days.")
+            return redirect(url_for("subscription"))
 
     flash("Payment was not completed successfully.")
-    return redirect(url_for("subscription"))
+    return redirect(url_for("subscription")) if current_user() else redirect(url_for("login"))
 
 
 # ============================================================
@@ -1037,6 +1025,22 @@ def admin_dashboard():
         "SELECT COUNT(*) AS total FROM members"
     ).fetchone()["total"]
 
+    contributions = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM contributions
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
+
+    payouts = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount),0) AS total
+        FROM payouts
+        WHERE status = 'paid'
+        """
+    ).fetchone()["total"]
+
     premium_users = conn.execute(
         """
         SELECT COUNT(*) AS total
@@ -1085,12 +1089,12 @@ def admin_dashboard():
             <div class="stat">{money(premium_revenue)}</div>
         </div>
         <div class="card">
-            <h3>Platform Role</h3>
-            <div class="stat">Owner</div>
+            <h3>Ajo Contributions</h3>
+            <div class="stat">{money(contributions)}</div>
         </div>
-        <div class="card notice">
-            <h3>🔐 Fund Safety</h3>
-            <p>AjoConnect does not hold members' Ajo money. Contribution and payout records are managed by each group.</p>
+        <div class="card">
+            <h3>Ajo Payouts</h3>
+            <div class="stat">{money(payouts)}</div>
         </div>
     </div>
 
@@ -1184,6 +1188,14 @@ def create_group():
             conn.close()
             flash("Group name is required.")
             return redirect(url_for("create_group"))
+
+        if contribution <= 0:
+            conn.close()
+            flash("Contribution must be greater than zero.")
+            return redirect(url_for("create_group"))
+
+        if frequency not in {"weekly", "biweekly", "monthly"}:
+            frequency = "monthly"
 
         conn.execute(
             """
@@ -1638,9 +1650,11 @@ def record_contribution(group_id, member_id):
 
         try:
             amount = float(amount)
+            if amount <= 0:
+                raise ValueError
         except ValueError:
             conn.close()
-            flash("Invalid contribution amount.")
+            flash("Contribution amount must be greater than zero.")
             return redirect(url_for(
                 "record_contribution",
                 group_id=group_id,
@@ -1767,6 +1781,16 @@ def record_payout(group_id, member_id):
 
     expected_payout = group["contribution"] * member_count
 
+    already_paid = conn.execute(
+        "SELECT id FROM payouts WHERE group_id = ? AND member_id = ? AND status = 'paid' LIMIT 1",
+        (group_id, member_id)
+    ).fetchone()
+
+    if already_paid:
+        conn.close()
+        flash("This member has already received a payout for this Ajo cycle.")
+        return redirect(url_for("member_detail", group_id=group_id, member_id=member_id))
+
     if request.method == "POST":
         amount = request.form.get("amount", str(expected_payout))
         payout_date = request.form.get(
@@ -1776,9 +1800,11 @@ def record_payout(group_id, member_id):
 
         try:
             amount = float(amount)
+            if amount <= 0:
+                raise ValueError
         except ValueError:
             conn.close()
-            flash("Invalid payout amount.")
+            flash("Payout amount must be greater than zero.")
             return redirect(url_for(
                 "record_payout",
                 group_id=group_id,
